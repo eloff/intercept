@@ -4,18 +4,20 @@
 #define INTERCEPT_MANUAL(...)
 #define INTERCEPT_METHOD(...)
 #define INTERCEPT(...)
+#define INTERCEPT_LOG_MANUAL(...)
+#define INTERCEPT_LOG(...)
+#define INTERCEPT_LOG_METHOD(...)
 #else
 
 // If you're going to code in C++ you'd better have a healthy sense of humor...
 #define INTERCEPT_STOP_HAMMER_TIME(x) #x
-#define INTERCEPT_STOP_HAMMER_TIME2(x, y) x ## y
-#define INTERCEPT_CONCATIFY(x, y) INTERCEPT_STOP_HAMMER_TIME2(x, y)
 #define INTERCEPT_STRINGIFICATE(x) INTERCEPT_STOP_HAMMER_TIME(x)
 
 #include <stdint.h>
 #include <memory.h>
 #include <stdio.h>
 #include <functional>
+#include <string>
 #include <vector>
 #include <unordered_map>
 #include <type_traits>
@@ -24,8 +26,37 @@
 
 namespace Intercept {
 	struct HashCString {
-		inline size_t operator()(const char* s) const {
-			return size_t(s);
+		inline size_t operator()(const char* str) const {
+			auto hash = size_t(2870177450012600261ull);
+			auto qwords = (size_t*)str;
+#if INTPTR_MAX == INT64_MAX
+			auto hasZero = [](size_t v) { return (((v) - 0x0101010101010101ul) & ~(v) & 0x8080808080808080ul); };
+			auto rotl64 = [](size_t x, size_t r) { return ((x << r) | (x >> (64 - r))); };
+
+			// We know it's safe to read at least up to the next full page boundary minus 8
+			size_t end = ((uintptr_t(str) + 4095) & ~uintptr_t(4095)) - 8;
+			while (uintptr_t(qwords) < end) {
+				size_t h = *qwords;
+				if (hasZero(h))
+					break;
+
+				h *= 11400714785074694791ul;
+				h = rotl64(h,31);
+				h *= 11400714785074694791ul;
+				hash ^= h;
+				hash = rotl64(hash,27) * 11400714785074694791ul + 9650029242287828579ul;
+				++qwords;
+			}
+#endif
+			// Now go a byte at a time, it may not be safe to read beyond the end of the string
+			auto bytes = (char*)qwords;
+			size_t c;
+			while((c=*bytes++)) {
+				hash ^= c;
+				hash *= 0x01000193;
+			}
+
+			return hash;
 		}
 	};
 
@@ -54,61 +85,95 @@ namespace Intercept {
 }
 
 #define INTERCEPT_MANUAL(name, ret, self, ...) do { \
-	static Intercept::Hook hook(name, self == nullptr); \
 	auto ctx = Intercept::Context::get(); \
-	if (ctx && hook.enabled()) { \
-		ctx->pushFrame(hook, ##__VA_ARGS__); \
-		if (hook.mocked()) return hook.callMock<ret>(self); }} while(0)
+	if (ctx) { \
+		static Intercept::Hook h; \
+		static auto hook = h.registerHook(name, self == nullptr, __FILE__, __LINE__); \
+		if (hook->enabled()) { \
+			auto frame = ctx->pushFrame(*hook, self, ##__VA_ARGS__); \
+			if (hook->mocked()) return hook->callMock<ret>(frame); }}} while(0)
+
+#define INTERCEPT_LOG_MANUAL(name, self, ...) do { \
+	auto ctx = Intercept::Context::get(); \
+	if (ctx) { \
+		static Intercept::Hook h; \
+		static auto hook = h.registerHook(name, self == nullptr, __FILE__, __LINE__); \
+		if (ctx && hook->enabled()) { \
+			auto frame = ctx->pushFrame(*hook, self, ##__VA_ARGS__); \
+			if (hook->mocked()) hook->callMock<void>(frame); }}} while(0)
 
 #define INTERCEPT(name, ret, ...) INTERCEPT_MANUAL(name, ret, nullptr, ##__VA_ARGS__)
 #define INTERCEPT_METHOD(name, ret, ...) INTERCEPT_MANUAL(name, ret, this, ##__VA_ARGS__)
+#define INTERCEPT_LOG(name, ...) INTERCEPT_LOG_MANUAL(name, nullptr, ##__VA_ARGS__)
+#define INTERCEPT_LOG_METHOD(name, ...) INTERCEPT_LOG_MANUAL(name, this, ##__VA_ARGS__)
 
 namespace Intercept {
+	typedef unsigned char byte;
+
 	class Hook {
-		const char* _name;
+		const char* _file;
+		int _line;
 		bool _isMethod;
 		bool _wasReached;
 		std::atomic<bool> _enabled;
 		std::atomic<bool> _hasMock;
-		std::function<void(void*)> mock;
+		std::function<void(const Frame*)> mock;
 
 	public:
-		inline Hook(const char* name, bool isMethod, bool registerHook=true) :
-			_name(name), _isMethod(isMethod), _wasReached(registerHook), _enabled(INTERCEPT_CONFIG_ENABLED), _hasMock(false)
+		const char* name;
+
+		inline Hook* registerHook(const char* name, bool isMethod, const char* file, int line)
 		{
-			if (registerHook) {
-				std::lock_guard<std::mutex> lock(gRegisterMutex);
-				auto result = gHooks.insert(std::make_pair(name, this));
-				if (!result.second) {
-					Hook* existing = result.first->second;
-					mock = std::move(existing->mock);
-					result.first->second = this;
-					_hasMock.store(existing->mocked(), std::memory_order_release);
-					delete existing;
+			this->name = name;
+			_file = file;
+			_line = line;
+			_isMethod = isMethod;
+			_wasReached = true;
+			_enabled = INTERCEPT_CONFIG_ENABLED;
+			_hasMock = false;
+			std::lock_guard<std::mutex> lock(gRegisterMutex);
+			auto result = gHooks.insert(std::make_pair(name, this));
+			if (!result.second) {
+				Hook* existing = result.first->second;
+				if (existing->wasReached()) {
+					if (!(existing->_line == line && ::strcmp(existing->_file, file) == 0))
+						throw std::logic_error(std::string("already initialized hook for ") + name + " at " + location());
+
+					return existing;
 				}
+
+				if (existing->mocked()) {
+					mock = std::move(existing->mock);
+					_hasMock.store(true, std::memory_order_release);
+				}
+				result.first->second = this;
+				delete existing;
 			}
+			return this;
 		}
 
 		template<class F>
 		void setMock(F&& f) {
 			if (_hasMock.load(std::memory_order_acquire))
-				throw std::logic_error("cannot set mock if it's already set, use clearMock first if changing it");
+				throw std::logic_error(std::string("cannot set mock if it's already set, use clearMock first if changing it. hook: ") + name);
 
 			// Coerce the damn thing into a std::function<void(void*)>. We'll coerce it back when we call it.
-			new (&mock) std::function<decltype(f.operator()(nullptr))(void*)>(f);
+			new (&mock) std::function<decltype(f.operator()(nullptr))(const Frame*)>(f);
 			_hasMock.store(true, std::memory_order_release);
 		}
 
 		inline void clearMock() {
-			if (!_hasMock.load(std::memory_order_acquire))
-				throw std::logic_error("mock is already clear");
 			_hasMock.store(false, std::memory_order_release);
-			new (&mock) std::function<void(Context&)>();
+			memset(&mock, 0, sizeof(mock));
 		}
 
 		template<class T>
-		T callMock(void* thisPtr=nullptr) {
-			return ((std::function<T(void*)>*)&mock)->operator()(thisPtr);
+		T callMock(const Frame* frame) {
+			return ((std::function<T(const Frame*)>*)&mock)->operator()(frame);
+		}
+
+		inline std::string location() const {
+			return _file + (":" + std::to_string(_line));
 		}
 
 		inline bool wasReached() const noexcept {
@@ -133,10 +198,6 @@ namespace Intercept {
 
 		inline bool disable() noexcept {
 			return _enabled.exchange(false);
-		}
-
-		inline const char* name() const noexcept {
-			return _name;
 		}
 	};
 
@@ -203,7 +264,7 @@ namespace Intercept {
 
 		inline uint32_t count() const noexcept {
 			uint32_t count = 0;
-			for (auto it=begin(); it != end(); ++it)
+			for (auto it=begin(), end = this->end(); it != end; ++it)
 				count++;
 			return count;
 		}
@@ -212,6 +273,7 @@ namespace Intercept {
 #pragma pack(4)
 	class Frame {
 		Hook& _hook;
+		void* _this;
 		uint32_t _ctx;
 		uint32_t _prev;
 		uint16_t _argCount;
@@ -219,8 +281,8 @@ namespace Intercept {
 		uint16_t _offsets[];
 
 	public:
-		inline Frame(Context& ctx, Hook& hook, uint32_t prev, uint16_t count) :
-			_hook(hook), _ctx(uint32_t(uintptr_t(this) - uintptr_t(&ctx))), _prev(prev), _argCount(count), _size(uint16_t(sizeof(Frame)) + count*2) {}
+		inline Frame(Context& ctx, Hook& hook, void* self, uint32_t prev, uint16_t count) :
+			_hook(hook), _this(self), _ctx(uint32_t(uintptr_t(this) - uintptr_t(&ctx))), _prev(prev), _argCount(count), _size(uint16_t(sizeof(Frame)) + count*2) {}
 
 		inline Hook* hook() const {
 			return &_hook;
@@ -237,6 +299,11 @@ namespace Intercept {
 		const Frame* prev() const;
 		inline const Frame* next() const {
 			return (Frame*)((char*)this + _size);
+		}
+
+		template<class T>
+		const T* getThis() const {
+			return (T*)_this;
 		}
 
 		template<class T>
@@ -260,20 +327,22 @@ namespace Intercept {
 #pragma pack()
 
 	class Context {
-		std::unordered_map<uintptr_t,uint32_t> _called;
-		std::vector<Hook*> _mocks;
+		std::unordered_map<const char*,uint32_t,HashCString,EqCString> _called;
+		std::vector<const char*> _mocks;
 		std::vector<std::function<void(void)> > _dtors;
 		uint32_t _count = 0;
 		uint32_t pos = 0;
+		uint32_t bufSize = INTERCEPT_STACK_BUFFER_SIZE;
+		char* buf;
 		const Frame* lastFrame;
-		char buf[INTERCEPT_STACK_BUFFER_SIZE];
+		char _buf[INTERCEPT_STACK_BUFFER_SIZE];
 
 	public:
 		inline static Context* get() noexcept {
 			return tlsCtx;
 		}
 
-		inline Context() : lastFrame((Frame*)buf) {
+		inline Context() : buf(_buf), lastFrame((Frame*)buf) {
 			tlsCtx = this;
 		}
 
@@ -281,55 +350,114 @@ namespace Intercept {
 			for (auto& dtor : _dtors) {
 				dtor();
 			}
-			for (auto hook : _mocks) {
-				if (hook->wasReached())
-					::fprintf(stderr, "WARNING: hook %s was never reached!", hook->name());
+			tlsCtx = nullptr;
+			if (buf != _buf) {
+				delete [] buf;
+				buf = nullptr;
+			}
+			std::lock_guard<std::mutex> lock(gRegisterMutex);
+			for (auto hookName : _mocks) {
+				auto hook = gHooks[hookName];
+				if (!hook->wasReached())
+					::fprintf(stderr, "WARNING: hook %s was mocked but never reached!\n", hook->name);
 
 				hook->clearMock();
 			}
-			tlsCtx = nullptr;
 		}
 
 		Context(const Context&) = delete;
 		Context(Context&&) = delete;
 
-		template<class F>
-		void setMock(const char* name, F&& f) {
-			auto result = gHooks.insert({name,nullptr});
-			Hook* hook = result.first->second;
-			// If there wasn't already a hook by that name, the INTERCEPT hasn't been reached yet.
-			// Create a temporary Hook on the heap and attach the mock to that. When the INTERCEPT
-			// runs we'll replace it and delete this temporary hook after copying the mock.
-			if (result.second)
-				result.first->second = hook = new Hook(name, false, false);
-
-			hook->setMock(f);
-			_mocks.push_back(hook);
+		inline void reset() {
+			this->~Context();
+			new (this) Context();
 		}
 
-		Frame* createFrame(Hook& hook, size_t numArgs=0) {
-			char* dest = buf+pos;
-			auto result = _called.insert({uintptr_t(&hook),pos});
-			auto hdrSize = uint32_t(sizeof(Frame) + numArgs*2);
-			pos += hdrSize;
-			if (pos >= sizeof(buf))
-				throw std::out_of_range("too many frames, disable some hooks or increase INTERCEPT_STACK_BUFFER_SIZE");
+		inline void clear() {
+			for (auto& dtor : _dtors) {
+				dtor();
+			}
+			_dtors.clear();
+			_called.clear();
+			pos = 0;
+			_count = 0;
+			lastFrame = (Frame*)buf;
+		}
 
-			auto frame = new (dest) Frame(*this, hook, (result.second) ? 0 : result.first->second, numArgs);
+		inline void grow() {
+			auto newSize = bufSize*2;
+			char* newBuf = new char[newSize];
+			memcpy(newBuf, buf, bufSize);
+			lastFrame = (const Frame*)(newBuf + uintptr_t(lastFrame) - uintptr_t(buf));
+			buf = newBuf;
+			bufSize = newSize;
+			// TODO use dtors to copy the objects that might need to invoke a copy constructor
+		}
+
+		template<class F>
+		void setMock(const char* name, F&& f) {
+			Hook* hook;
+			{
+				std::lock_guard<std::mutex> lock(gRegisterMutex);
+				auto result = gHooks.insert({name,nullptr});
+				hook = result.first->second;
+				// If there wasn't already a hook by that name, the INTERCEPT hasn't been reached yet.
+				// Create a temporary Hook on the heap and attach the mock to that. When the INTERCEPT
+				// runs we'll replace it and delete this temporary hook after copying the mock.
+				if (result.second) {
+					result.first->second = hook = new Hook();
+					hook->name = name;
+				}
+			}
+
+			hook->setMock(f);
+			_mocks.push_back(name);
+		}
+
+		void clearMock(const char* name) {
+			Hook* hook;
+			{
+				std::lock_guard<std::mutex> lock(gRegisterMutex);
+				hook = gHooks[name];
+			}
+			hook->clearMock();
+			_mocks.erase(
+				std::remove_if(_mocks.begin(), _mocks.end(), [=](const char* other) { return ::strcmp(name, other) == 0; }),
+				_mocks.end()
+			);
+		}
+
+		Frame* createFrame(Hook& hook, const void* self, size_t numArgs=0) {
+			char* dest = buf+pos;
+			auto result = _called.insert({hook.name,pos});
+			auto hdrSize = uint32_t(sizeof(Frame) + numArgs*2);
+
+			uint32_t prevPos = 0;
+			if (!result.second) {
+				prevPos = result.first->second;
+				result.first->second = pos;
+			}
+
+			pos += hdrSize;
+			if (pos >= bufSize)
+				grow();
+
+			auto frame = new (dest) Frame(*this, hook, const_cast<void*>(self), prevPos, numArgs);
 			lastFrame = frame;
 			_count++;
 			return frame;
 		}
 
-		void pushFrame(Hook& hook) {
-			createFrame(hook);
+		const Frame* pushFrame(Hook& hook, const void* self) {
+			return createFrame(hook, self);
 		}
 
 		template<class... Args>
-		void pushFrame(Hook& hook, const Args&... args) {
-			auto frame = createFrame(hook, sizeof...(Args));
+		const Frame* pushFrame(Hook& hook, const void* self, const Args&... args) {
+			auto frame = createFrame(hook, self, sizeof...(Args));
 			uint32_t argIndex = 0;
 			putArgs(frame, argIndex, args...);
+			return frame;
 		}
 
 		template<class T, class... Args>
@@ -342,20 +470,18 @@ namespace Intercept {
 		void putArgs(Frame* frame, uint32_t argIndex, const T& arg) {
 			char* dest = buf+pos;
 			pos += sizeof(T);
-			if (pos >= sizeof(buf))
-				throw std::out_of_range("too many frames, disable some hooks or increase INTERCEPT_STACK_BUFFER_SIZE");
+			if (pos >= bufSize)
+				grow();
 
 			frame->put(argIndex, dest, arg);
-			if (!std::is_trivially_destructible<T>::value)
-				_dtors.emplace_back([=]() { ((T*)dest)->~T(); });
+			if (!std::is_trivially_destructible<T>::value) {
+				// Use buf and pos here, because we might grow buf, meaning dest might not point to the object anymore
+				_dtors.emplace_back([self=this,p=pos]() { ((T*)(self->buf + p))->~T(); });
+			}
 		}
 
 		inline const Frame* operator[](const char* name) const {
-			auto hookIt = gHooks.find(name);
-			if (hookIt == gHooks.end())
-				return nullptr;
-
-			auto it = _called.find(uintptr_t(hookIt->second));
+			auto it = _called.find(name);
 			if (it == _called.end())
 				return nullptr;
 
@@ -367,7 +493,11 @@ namespace Intercept {
 		}
 
 		inline bool called(const char* name) const {
-			return !(*this)[name];
+			return (*this)[name] != nullptr;
+		}
+
+		inline uint32_t count(const char* name) const {
+			return allCalls(name).count();
 		}
 
 		inline uint32_t count() const noexcept {
