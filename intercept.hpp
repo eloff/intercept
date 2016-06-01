@@ -6,11 +6,18 @@
 #define INTERCEPT(...)
 #define INTERCEPT_VOID_METHOD(...)
 #define INTERCEPT_VOID(...)
+#define INTERCEPT_REPLACE(...)
+#define INTERCEPT_TEARDOWN(f)
 #else
 
 // If you're going to code in C++ you'd better have a healthy sense of humor...
 #define INTERCEPT_STOP_HAMMER_TIME(x) #x
+#define STOP_HAMMER_TIME2(x, y) x ## y
+#define INTERCEPT_CONCATIFY(x, y) STOP_HAMMER_TIME2(x, y)
 #define INTERCEPT_STRINGIFICATE(x) INTERCEPT_STOP_HAMMER_TIME(x)
+
+#define INTERCEPT_REPLACE(ref, newVal) auto INTERCEPT_CONCATIFY(_replace, __LINE__) = Intercept::replace(ref, newVal)
+#define INTERCEPT_TEARDOWN(f) Intercept::TearDown INTERCEPT_CONCATIFY(_teardown, __LINE__)(f)
 
 #include <stdint.h>
 #include <memory.h>
@@ -129,6 +136,38 @@ namespace Intercept {
 
 		inline Disabler(Hook& hook);
 		inline ~Disabler();
+	};
+
+	template<class T>
+	struct Replace {
+		T& ref;
+		T oldVal;
+
+		Replace(T& ref, T newVal) : ref(ref), oldVal(ref) {
+			ref = newVal;
+		}
+
+		~Replace() {
+			ref = oldVal;
+		}
+	};
+
+	template<class T>
+	Replace<T> replace(T& ref, T newVal) {
+		return Replace<T>(ref, newVal);
+	}
+
+	struct TearDown {
+		std::function<void(void)> cleanup;
+
+		template<class F>
+		TearDown(F&& f) {
+			new (&cleanup) std::function<void(void)>(std::move(f));
+		}
+
+		inline ~TearDown() {
+			cleanup();
+		}
 	};
 
 	class Hook {
@@ -292,6 +331,9 @@ namespace Intercept {
 			_this(self), _hook(hook), _ctx(uint32_t(uintptr_t(this) - uintptr_t(&ctx))),
 			_prev(prev), _hasReturn(false), _hasVoidReturn(false), _argCount(count), _size(uint16_t(sizeof(Frame)) + count*2) {}
 
+		Frame(const Frame&) = delete;
+		Frame(Frame&&) = delete;
+
 		inline Hook& hook() const {
 			return _hook;
 		}
@@ -359,7 +401,7 @@ namespace Intercept {
 	private:
 		template<class T>
 		void put(uint32_t i, char* dest, const T& arg) {
-			_offsets[i] = uintptr_t(dest) - uintptr_t(_offsets);
+			_offsets[i] = uintptr_t(dest) - uintptr_t(&_offsets[0]);
 			new (dest) T(arg);
 			_size += sizeof(arg);
 		}
@@ -489,7 +531,7 @@ namespace Intercept {
 		inline Frame* createFrame(Hook& hook, const void* self, uint32_t retSize, uint32_t numArgs=0) {
 			char* dest = buf+pos;
 			auto result = _called.insert({hook.name,pos});
-			auto hdrSize = uint32_t(sizeof(Frame)) + numArgs*2 + retSize;
+			auto hdrSize = uint32_t(sizeof(Frame)) + numArgs*2;
 
 			uint32_t prevPos = 0;
 			if (!result.second) {
@@ -516,6 +558,11 @@ namespace Intercept {
 			auto frame = createFrame(hook, self, retSize, uint32_t(sizeof...(Args)));
 			uint32_t argIndex = 0;
 			putArgs(frame, argIndex, args...);
+
+			// Leave (soft) space for return value. Next frame will overwrite it.
+			if (pos + retSize >= bufSize)
+				grow();
+
 			return frame;
 		}
 
