@@ -86,18 +86,25 @@ namespace Intercept {
 #define INTERCEPT_CONFIG_ENABLED true
 #endif
 
-#define INTERCEPT_NOOP Intercept::gNoop
-
 namespace Intercept {
 	extern std::mutex gInternMutex;
 	extern std::unordered_set<const char *, HashCString, EqCString> gInterned;
 	extern thread_local Context* tlsCtx;
-	extern void (*gNoop)(Frame*);
 
 	inline const char* intern(const char* s) {
 		std::lock_guard<std::mutex> lock(gInternMutex);
 		auto result = gInterned.insert(s);
 		return *result.first;
+	}
+
+	template<class T>
+	typename std::enable_if<std::is_default_constructible<T>::value, T>::type makeDefault(const char* err) {
+		return T();
+	}
+
+	template<class T>
+	typename std::enable_if<!std::is_default_constructible<T>::value, T>::type makeDefault(const char* err) {
+		throw std::logic_error(std::string(err) + " is not default constructable (use setMock with Frame::setReturn instead?)");
 	}
 }
 
@@ -108,6 +115,7 @@ namespace Intercept {
 		auto hook = ctx->getHook(hName, self == nullptr, __FILE__, __LINE__); \
 		if (hook->enabled()) { \
 			auto frame = ctx->pushFrame(*hook, self, sizeof(ret), ##__VA_ARGS__); \
+			if (hook->noop()) return Intercept::makeDefault<ret>(#ret); \
 			if (hook->mocked()) { \
 				hook->callMock(frame); \
 				if (frame->hasReturn()) return frame->getReturn<ret>(); }}}} while(0)
@@ -119,6 +127,7 @@ namespace Intercept {
 		auto hook = ctx->getHook(hName, self == nullptr, __FILE__, __LINE__); \
 		if (hook->enabled()) { \
 			auto frame = ctx->pushFrame(*hook, self, 0, ##__VA_ARGS__); \
+			if (hook->noop()) return; \
 			if (hook->mocked()) { \
 				hook->callMock(frame); \
 				if (frame->hasVoidReturn()) return; }}}} while(0)
@@ -176,6 +185,7 @@ namespace Intercept {
 		bool _isMethod;
 		bool _wasReached = false;
 		bool _enabled = INTERCEPT_CONFIG_ENABLED;
+		bool _noop = false;
 		std::function<void(Frame*)> mock;
 
 	public:
@@ -187,6 +197,14 @@ namespace Intercept {
 		inline Hook(const char* name, bool isMethod, const char* file, int line)
 			: _file(file), _line(line), _isMethod(isMethod), name(name)
 		{}
+
+		inline bool noop() const {
+			return _noop;
+		}
+
+		inline void noop(bool val) {
+			_noop = val;
+		}
 
 		inline void setMock(std::function<void(Frame*)>&& f) {
 			mock = std::move(f);
@@ -516,10 +534,18 @@ namespace Intercept {
 			return hook;
 		}
 
-		inline void setMock(const char* name, std::function<void(Frame*)>&& f) {
+		// Can use std::function<void(Frame*)> here instead of template<class F>, but CLion doesn't understand it. This is OK for now.
+		template<class F>
+		inline void setMock(const char* name, F&& f) {
 			name = intern(name);
 			Hook* hook = getHook(name);
 			hook->setMock(std::move(f));
+		}
+
+		inline void noop(const char* name) {
+			name = intern(name);
+			Hook* hook = getHook(name);
+			hook->noop(true);
 		}
 
 		inline void clearMock(const char* name) {
@@ -669,7 +695,6 @@ namespace Intercept {
 	thread_local Context* tlsCtx = nullptr;
 	std::mutex gInternMutex;
 	std::unordered_set<const char *, HashCString, EqCString> gInterned;
-	void (*gNoop)(Frame*) = [](Frame* f) { f->setReturn(); };
 }
 #endif
 
