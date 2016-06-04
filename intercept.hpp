@@ -309,26 +309,25 @@ namespace Intercept {
 		typedef const Frame value_type;
 		typedef PrevFrameIter iterator;
 
-	public:
-		using PrevFrameIter::PrevFrameIter;
+		uint32_t _count;
 
-		iterator begin() const noexcept {
+	public:
+		inline FrameList(const Frame* frame=nullptr, uint32_t count=0) : PrevFrameIter(frame), _count(count) {}
+
+		inline iterator begin() const noexcept {
 			return *this;
 		}
 
-		iterator end() const noexcept {
+		inline iterator end() const noexcept {
 			return iterator();
 		}
 
-		bool empty() const {
+		inline bool empty() const {
 			return frame != nullptr;
 		}
 
 		inline uint32_t count() const noexcept {
-			uint32_t count = 0;
-			for (auto it=begin(), end = this->end(); it != end; ++it)
-				count++;
-			return count;
+			return _count;
 		}
 	};
 
@@ -444,7 +443,12 @@ namespace Intercept {
 			Copier(Copier&&) = default;
 		};
 
-		std::unordered_map<const char*,uint32_t> _called;
+		struct CallInfo {
+			uint32_t lastPos;
+			uint32_t count;
+		};
+
+		std::unordered_map<const char*,CallInfo> _called;
 		std::unordered_map<const char*,Hook*> _hooks;
 		std::vector<Copier> _copies;
 		uint32_t _count = 0;
@@ -556,13 +560,14 @@ namespace Intercept {
 
 		inline Frame* createFrame(Hook& hook, const void* self, uint32_t retSize, uint32_t numArgs=0) {
 			char* dest = buf+pos;
-			auto result = _called.insert({hook.name,pos});
+			auto result = _called.insert({hook.name,{pos,1}});
 			auto hdrSize = uint32_t(sizeof(Frame)) + numArgs*2;
 
 			uint32_t prevPos = 0;
 			if (!result.second) {
-				prevPos = result.first->second;
-				result.first->second = pos;
+				prevPos = result.first->second.lastPos;
+				result.first->second.lastPos = pos;
+				result.first->second.count++;
 			}
 
 			pos += hdrSize;
@@ -619,11 +624,15 @@ namespace Intercept {
 			if (it == _called.end())
 				return nullptr;
 
-			return (const Frame*)(buf + it->second);
+			return (const Frame*)(buf + it->second.lastPos);
 		}
 
 		inline FrameList allCalls(const char* name) const {
-			return FrameList((*this)[name]);
+		auto it = _called.find(name);
+			if (it == _called.end())
+				return FrameList();
+
+			return FrameList((const Frame*)(buf + it->second.lastPos), it->second.count);
 		}
 
 		inline bool called(const char* name) const {
