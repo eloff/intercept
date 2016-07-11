@@ -82,6 +82,10 @@ namespace Intercept {
 #define INTERCEPT_STACK_BUFFER_SIZE 524288
 #endif
 
+#ifndef INTERCEPT_MAX_BUFFER_SIZE
+#define INTERCEPT_MAX_BUFFER_SIZE 67108864 // 64MB
+#endif
+
 #ifndef INTERCEPT_CONFIG_ENABLED
 #define INTERCEPT_CONFIG_ENABLED true
 #endif
@@ -141,9 +145,13 @@ namespace Intercept {
 	typedef unsigned char byte;
 
 	struct Disabler {
-		Hook& hook;
+		Hook* hook;
 
 		inline Disabler(Hook& hook);
+		inline Disabler(Disabler&& other) {
+			hook = other.hook;
+			other.hook = nullptr;
+		}
 		inline ~Disabler();
 	};
 
@@ -178,6 +186,13 @@ namespace Intercept {
 			cleanup();
 		}
 	};
+
+	template<typename T>
+    T nextMultipleOf(T i, T factor)
+    {
+    	--factor;
+        return (i + factor) & ~factor;
+    }
 
 	class Hook {
 		const char* _file;
@@ -255,12 +270,13 @@ namespace Intercept {
 		}
 	};
 
-	inline Disabler::Disabler(Hook& hook) : hook(hook) {
+	inline Disabler::Disabler(Hook& hook) : hook(&hook) {
 		hook.disable();
 	}
 
 	inline Disabler::~Disabler() {
-		hook.enable();
+		if (hook != nullptr)
+			hook->enable();
 	}
 
 	class FrameIterBase {
@@ -331,6 +347,7 @@ namespace Intercept {
 		}
 	};
 
+	// Use pack(4) to prevent the compiler from adding padding to Frame, we handle alignment and padding ourselves
 #pragma pack(4)
 	class Frame {
 		void* _this;
@@ -381,7 +398,8 @@ namespace Intercept {
 			if (i >= _argCount)
 				throw std::out_of_range("index to Frame::get<T>() out of range");
 
-			return *(T*)((char*)_offsets + _offsets[i]);
+			auto p = (T*)((char*)_offsets + _offsets[i]);
+			return *p;
 		}
 
 		inline bool hasReturn() const noexcept {
@@ -415,10 +433,16 @@ namespace Intercept {
 		void setReturn() {
 			_hasVoidReturn = true;
 		}
+
+		inline Disabler disableMockInScope() noexcept {
+			return Disabler(hook());
+		}
 	private:
 		template<class T>
 		void put(uint32_t i, char* dest, const T& arg) {
 			_offsets[i] = uintptr_t(dest) - uintptr_t(&_offsets[0]);
+			assert(i != 0 || _offsets[0] < _argCount*2 + alignof(T));
+
 			new (dest) T(arg);
 			_size += sizeof(arg);
 		}
@@ -456,7 +480,7 @@ namespace Intercept {
 		uint32_t hookAlloc = 0;
 		uint32_t bufSize = INTERCEPT_STACK_BUFFER_SIZE/2;
 		char* buf;
-		const Frame* lastFrame;
+		Frame* lastFrame;
 		char _buf[INTERCEPT_STACK_BUFFER_SIZE/2];
 		Hook _hookStorage[INTERCEPT_STACK_BUFFER_SIZE/2/sizeof(Hook)];
 
@@ -479,7 +503,7 @@ namespace Intercept {
 				buf = nullptr;
 			}
 			for (auto& hook : _hooks) {
-				if (!hook.second->wasReached())
+				if (!hook.second->noop() && !hook.second->wasReached())
 					::fprintf(stderr, "WARNING: hook %s was mocked but never reached!\n", hook.second->name);
 			}
 		}
@@ -504,11 +528,14 @@ namespace Intercept {
 			lastFrame = (Frame*)buf;
 		}
 
-		inline void grow() {
+		inline Frame* grow() {
 			auto newSize = bufSize*2;
+			if (newSize > INTERCEPT_MAX_BUFFER_SIZE)
+				throw std::runtime_error("Intercept::Context buffer reached limit of " INTERCEPT_STRINGIFICATE(INTERCEPT_MAX_BUFFER_SIZE) " bytes (define INTERCEPT_MAX_BUFFER_SIZE to change limit)");
+
 			char* newBuf = new char[newSize];
 			memcpy(newBuf, buf, bufSize);
-			lastFrame = (const Frame*)(newBuf + uintptr_t(lastFrame) - uintptr_t(buf));
+			lastFrame = (Frame*)(newBuf + uintptr_t(lastFrame) - uintptr_t(buf));
 			buf = newBuf;
 			bufSize = newSize;
 			for (auto& c : _copies) {
@@ -516,6 +543,7 @@ namespace Intercept {
 				c.cctor(newBuf + c.pos, obj);
 				c.dtor(obj);
 			}
+			return lastFrame;
 		}
 
 		inline Hook* getHook(const char* name, bool isMethod=false, const char* file="unreached", int line=0)
@@ -571,8 +599,10 @@ namespace Intercept {
 			}
 
 			pos += hdrSize;
-			if (pos >= bufSize)
+			if (pos >= bufSize) {
 				grow();
+				dest = buf+pos-hdrSize;
+			}
 
 			auto frame = new (dest) Frame(*this, hook, const_cast<void*>(self), prevPos, numArgs);
 			lastFrame = frame;
@@ -581,43 +611,62 @@ namespace Intercept {
 		}
 
 		Frame* pushFrame(Hook& hook, const void* self, uint32_t retSize) {
-			return createFrame(hook, self, retSize);
+			auto frame = createFrame(hook, self, retSize);
+
+			// Leave (soft) space for return value. Next frame will overwrite it.
+			if (nextMultipleOf(pos, retSize) + retSize >= bufSize)
+				frame = grow();
+
+			return frame;
 		}
 
 		template<class... Args>
 		Frame* pushFrame(Hook& hook, const void* self, uint32_t retSize, const Args&... args) {
-			auto frame = createFrame(hook, self, retSize, uint32_t(sizeof...(Args)));
+			createFrame(hook, self, retSize, uint32_t(sizeof...(Args)));
 			uint32_t argIndex = 0;
-			putArgs(frame, argIndex, args...);
+			putArgs(argIndex, args...);
+
+			// Align buffer for next
+			auto alignedPos = nextMultipleOf(pos, uint32_t(sizeof(void*)));
+			lastFrame->_size += alignedPos - pos;
+			// No need to check if we need to grow(), buffer size is a multiple of sizeof(void*)
+			pos = alignedPos;
 
 			// Leave (soft) space for return value. Next frame will overwrite it.
 			if (pos + retSize >= bufSize)
 				grow();
 
-			return frame;
+			return lastFrame;
 		}
 
 		template<class T, class... Args>
-		void putArgs(Frame* frame, uint32_t& argIndex, const T& arg, const Args&... args) {
-			putArgs(frame, argIndex++, arg);
-			putArgs(frame, argIndex, args...);
+		void putArgs(uint32_t& argIndex, const T& arg, const Args&... args) {
+			putArgs(argIndex++, arg);
+			putArgs(argIndex, args...);
 		}
 
 		template<class T>
-		void putArgs(Frame* frame, uint32_t argIndex, const T& arg) {
-			char* dest = buf+pos;
-			pos += sizeof(T);
+		void putArgs(uint32_t argIndex, const T& arg) {
+			uint32_t alignedPos = nextMultipleOf(pos, uint32_t(alignof(T)));
+			pos = alignedPos + sizeof(T);
 			if (pos >= bufSize)
 				grow();
 
-			frame->put(argIndex, dest, arg);
-			if (!std::is_trivially_destructible<T>::value || !std::is_trivially_copyable<T>::value) {
-				// Use buf and pos here, because we might grow buf, meaning dest might not point to the object anymore
-				_copies.emplace_back(pos,
-					(Copier::destructor)(void (*)(T*))[](T* obj) { obj->~T(); },
-					(Copier::copyConstructor)(void (*)(T*,const T*))[](T* dest, const T* src) { new (dest) T(*src); });
-			}
+			char* dest = buf + alignedPos;
+			lastFrame->put(argIndex, dest, arg);
+			nonTrivialCopy(arg);
 		}
+
+		template<class T>
+		void nonTrivialCopy(const typename std::enable_if<!std::is_trivially_destructible<T>::value || !std::is_trivially_copyable<T>::value, T>::type&) {
+			// Use buf and pos here, because we might grow buf, meaning dest might not point to the object anymore
+			_copies.emplace_back(pos,
+				(Copier::destructor)(void (*)(T*))[](T* obj) { obj->~T(); },
+				(Copier::copyConstructor)(void (*)(T*,const T*))[](T* dest, const T* src) { new (dest) T(*src); });
+		}
+
+		template<class T>
+		void nonTrivialCopy(const T&) {}
 
 		inline const Frame* operator[](const char* name) const {
 			auto it = _called.find(name);
